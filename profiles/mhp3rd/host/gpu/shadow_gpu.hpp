@@ -82,8 +82,17 @@ public:
     }
     VkDescriptorSet render(VkCommandBuffer command,unsigned n,const std::vector<std::array<float,4>> &points) {
         if(!device_ || region_>=3 || cursor_>=48 || points.empty()) return VK_NULL_HANDLE;
-        auto &r=regions_[region_];if(cursor_==r.size()) r.emplace_back();Item &i=r[cursor_++];
+        auto &r=regions_[region_];
         const VkDeviceSize bytes=points.size()*sizeof(points[0]);
+        // Casters of different sizes ask for different mask resolutions. Take a free
+        // slot that already holds an image of this size, so a changing mix of sizes
+        // does not destroy and recreate images every frame.
+        for(std::size_t k=cursor_;k<r.size();++k) if(r[k].resolution==n && r[k].capacity>=bytes) {
+            if(k!=cursor_) std::swap(r[cursor_],r[k]);
+            break;
+        }
+        if(cursor_==r.size()) r.emplace_back();
+        Item &i=r[cursor_++];
         if(i.resolution!=n || i.capacity<bytes) {
             release(i);
             try {

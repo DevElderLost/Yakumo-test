@@ -29,6 +29,9 @@ struct PlanarShadowOptions {
     float direction_z{0.30f};
     float floor_offset{};
     unsigned resolution{96};
+    // Distance LOD for silhouettes: 0 keeps every caster at full detail, 1 to 3
+    // drop casters that cover less than 6%, 3% or 1.5% of the screen height.
+    unsigned lod{2};
 
     static PlanarShadowOptions environment() {
         PlanarShadowOptions o;
@@ -52,6 +55,7 @@ struct PlanarShadowOptions {
         o.direction_z = number("MHP3RD_SHADOW_Z", o.direction_z, -2.0f, 2.0f);
         o.floor_offset = number("MHP3RD_SHADOW_FLOOR_OFFSET", 0.0f, -1000.0f, 1000.0f);
         o.resolution = static_cast<unsigned>(number("MHP3RD_SHADOW_RESOLUTION", 96.0f, 32.0f, 192.0f));
+        o.lod = static_cast<unsigned>(number("MHP3RD_SHADOW_DISTANCE", 2.0f, 0.0f, 3.0f));
         return o;
     }
 };
@@ -59,10 +63,23 @@ struct PlanarShadowOptions {
 class PlanarShadows {
     using Point = std::array<float, 3>;
     using Triangle = std::array<Point, 3>;
+    // Receiver triangles binned by world X/Z, so a caster only looks at the
+    // terrain around it instead of every triangle of the scene.
+    struct Grid {
+        bool built{};
+        std::size_t count{};
+        float x0{}, z0{}, inverse{};
+        unsigned width{}, height{};
+        std::vector<std::vector<std::uint32_t>> cells;
+        std::vector<std::uint32_t> large; // triangles spanning many cells
+        std::vector<std::uint32_t> seen;
+        std::uint32_t stamp{};
+    };
     struct Caster {
         DrawCall state;
         std::array<float, 16> world;
         std::vector<Triangle> triangles;
+        Grid grid; // receivers only
     };
     std::vector<Caster> casters_;
     std::vector<Caster> receivers_;
@@ -73,11 +90,15 @@ class PlanarShadows {
     std::size_t work_{};
     std::size_t emitted_{};
     std::size_t skipped_{};
+    std::size_t lod_culled_{};
+    std::vector<std::uint32_t> candidates_;
     std::uint64_t frame_{};
     bool trace_water_{};
     unsigned trace_draw_{};
     static constexpr std::size_t kTriangleLimit = 40000;
     static constexpr std::size_t kPixelWorkLimit = 4000000;
+    static constexpr unsigned kGridCells = 48;
+    static constexpr std::size_t kGridLargeCells = 64;
 
     static bool same_view(const DrawCall &a, const DrawCall &b) {
         return a.target.color_address == b.target.color_address && a.view == b.view && a.projection == b.projection;
@@ -183,9 +204,131 @@ class PlanarShadows {
         return polygon;
     }
 
-    DrawCall rasterize(const Caster &caster) {
+    static unsigned cell_of(float offset, float inverse, unsigned count) {
+        const float cell = std::floor(offset * inverse);
+        if (!(cell > 0.0f)) return 0;
+        if (cell >= static_cast<float>(count - 1)) return count - 1;
+        return static_cast<unsigned>(cell);
+    }
+
+    static void build_grid(Caster &receiver) {
+        Grid &g = receiver.grid;
+        g = Grid{};
+        g.built = true;
+        g.count = receiver.triangles.size();
+        if (receiver.triangles.empty()) return;
+        float min_x = std::numeric_limits<float>::max(), min_z = min_x;
+        float max_x = -min_x, max_z = -min_x;
+        for (const Triangle &t : receiver.triangles) for (const Point &p : t) {
+            min_x = std::min(min_x, p[0]); max_x = std::max(max_x, p[0]);
+            min_z = std::min(min_z, p[2]); max_z = std::max(max_z, p[2]);
+        }
+        const float span = std::max({max_x - min_x, max_z - min_z, 1e-3f});
+        g.x0 = min_x; g.z0 = min_z;
+        g.inverse = static_cast<float>(kGridCells) / span;
+        g.width = std::min(kGridCells, static_cast<unsigned>((max_x - min_x) * g.inverse) + 1u);
+        g.height = std::min(kGridCells, static_cast<unsigned>((max_z - min_z) * g.inverse) + 1u);
+        g.cells.assign(static_cast<std::size_t>(g.width) * g.height, {});
+        g.seen.assign(receiver.triangles.size(), 0u);
+        for (std::size_t i = 0; i < receiver.triangles.size(); ++i) {
+            const Triangle &t = receiver.triangles[i];
+            const unsigned cx0 = cell_of(std::min({t[0][0], t[1][0], t[2][0]}) - g.x0, g.inverse, g.width);
+            const unsigned cx1 = cell_of(std::max({t[0][0], t[1][0], t[2][0]}) - g.x0, g.inverse, g.width);
+            const unsigned cz0 = cell_of(std::min({t[0][2], t[1][2], t[2][2]}) - g.z0, g.inverse, g.height);
+            const unsigned cz1 = cell_of(std::max({t[0][2], t[1][2], t[2][2]}) - g.z0, g.inverse, g.height);
+            if (static_cast<std::size_t>(cx1 - cx0 + 1) * (cz1 - cz0 + 1) > kGridLargeCells) {
+                g.large.push_back(static_cast<std::uint32_t>(i));
+                continue;
+            }
+            for (unsigned cz = cz0; cz <= cz1; ++cz) for (unsigned cx = cx0; cx <= cx1; ++cx)
+                g.cells[static_cast<std::size_t>(cz) * g.width + cx].push_back(static_cast<std::uint32_t>(i));
+        }
+    }
+
+    // Visits the receiver triangles whose X/Z cells overlap the rectangle, each
+    // once and in their original order. The visitor returns false to stop.
+    template<class Visit>
+    void near_receivers(const DrawCall &state, float x0, float z0, float x1, float z1, Visit visit) {
+        for (Caster &receiver : receivers_) {
+            if (!same_view(receiver.state, state)) continue;
+            if (!receiver.grid.built || receiver.grid.count != receiver.triangles.size()) build_grid(receiver);
+            Grid &g = receiver.grid;
+            if (g.cells.empty()) continue;
+            if (++g.stamp == 0u) { std::fill(g.seen.begin(), g.seen.end(), 0u); g.stamp = 1u; }
+            candidates_.clear();
+            const auto add = [&](std::uint32_t i) {
+                if (g.seen[i] == g.stamp) return;
+                g.seen[i] = g.stamp;
+                candidates_.push_back(i);
+            };
+            for (std::uint32_t i : g.large) add(i);
+            const unsigned cx0 = cell_of(x0 - g.x0, g.inverse, g.width), cx1 = cell_of(x1 - g.x0, g.inverse, g.width);
+            const unsigned cz0 = cell_of(z0 - g.z0, g.inverse, g.height), cz1 = cell_of(z1 - g.z0, g.inverse, g.height);
+            for (unsigned cz = cz0; cz <= cz1; ++cz) for (unsigned cx = cx0; cx <= cx1; ++cx)
+                for (std::uint32_t i : g.cells[static_cast<std::size_t>(cz) * g.width + cx]) add(i);
+            std::sort(candidates_.begin(), candidates_.end());
+            for (std::uint32_t i : candidates_) if (!visit(receiver.triangles[i])) return;
+        }
+    }
+
+    struct Pick {
+        const Caster *caster{};
+        float distance{};
+        unsigned resolution{};
+        float fade{1.0f};
+    };
+
+    // Share of the screen height a caster covers below which its shadow is dropped.
+    static float lod_cull_fraction(unsigned lod) {
+        switch (lod) {
+        case 1: return 0.06f;
+        case 2: return 0.03f;
+        case 3: return 0.015f;
+        default: return 0.0f;
+        }
+    }
+
+    // Decides from the caster's size on screen whether it gets a silhouette,
+    // how fine its mask is and how strongly it fades out near the limit.
+    bool lod_select(const Caster &caster, Pick &pick) const {
+        pick.resolution = options.resolution;
+        if (options.lod == 0) return true;
+        Point low{1e30f, 1e30f, 1e30f}, high{-1e30f, -1e30f, -1e30f};
+        for (const Triangle &t : caster.triangles) for (const Point &p : t) for (unsigned k = 0; k < 3; ++k) {
+            low[k] = std::min(low[k], p[k]);
+            high[k] = std::max(high[k], p[k]);
+        }
+        const float height = high[1] - low[1];
+        if (!(height > 1e-3f)) return true;
+        const Point centre{(low[0] + high[0]) * 0.5f, (low[1] + high[1]) * 0.5f, (low[2] + high[2]) * 0.5f};
+        const auto &view = caster.state.view;
+        float squared = 0.0f;
+        for (unsigned k = 0; k < 3; ++k) {
+            const float c = view[k] * centre[0] + view[4 + k] * centre[1] + view[8 + k] * centre[2] + view[12 + k];
+            squared += c * c;
+        }
+        const float distance = std::sqrt(squared);
+        if (!std::isfinite(distance) || distance < 1e-3f) return true;
+        // projection[5] is cot(fov/2) for a perspective matrix: the height
+        // covers height / distance * cot / 2 of the screen.
+        const float cot = std::abs(caster.state.projection[5]);
+        const float scale = std::isfinite(cot) && cot > 0.1f && cot < 50.0f ? cot : 2.4f;
+        const float screen = height / distance * scale * 0.5f;
+        const float cull = lod_cull_fraction(options.lod);
+        if (screen <= cull) return false;
+        pick.distance = distance;
+        pick.fade = std::clamp((screen - cull) / cull, 0.0f, 1.0f);
+        unsigned resolution = options.resolution;
+        if (screen < 0.07f) resolution /= 4u;
+        else if (screen < 0.15f) resolution /= 2u;
+        pick.resolution = std::max(32u, (resolution / 8u) * 8u);
+        return true;
+    }
+
+    DrawCall rasterize(const Caster &caster, unsigned n, float fade) {
         DrawCall out = caster.state;
-        const unsigned n = options.resolution;
+        const float opacity = options.opacity * fade;
+        if (std::lround(opacity * 255.0f) <= 0) return out;
         float floor = std::numeric_limits<float>::max();
         float top = -floor;
         for (const auto &t : caster.triangles) for (const auto &p : t) {
@@ -200,10 +343,11 @@ class PlanarShadows {
         for(const auto &t:caster.triangles) for(const auto &p:t) {centre_x+=p[0];centre_z+=p[2];++points;}
         centre_x/=static_cast<float>(points);centre_z/=static_cast<float>(points);
         float ground=-std::numeric_limits<float>::infinity();
-        for(const Caster &r:receivers_) if(same_view(r.state,caster.state)) for(const auto &t:r.triangles) {
+        near_receivers(caster.state,centre_x,centre_z,centre_x,centre_z,[&](const Triangle &t) {
             float y{};
             if(height_at(t,centre_x,centre_z,y) && y<=floor+height*0.35f && y>=floor-height*2 && y>ground) ground=y;
-        }
+            return true;
+        });
         if(std::isfinite(ground)) floor=ground;
         floor += options.floor_offset;
         const float bias = std::max(0.02f, height * 0.002f);
@@ -231,22 +375,23 @@ class PlanarShadows {
                 job.points.push_back({(p[0]-x0)/dx,(p[2]-z0)/dz,0,0});
             // Submit nearby receiver triangles once. UV bounds and mask coverage
             // are evaluated per fragment on the GPU; no per-cell CPU clipping.
-            const auto alpha=static_cast<std::uint32_t>(std::lround(options.opacity*255));
-            for(const Caster &r:receivers_) if(same_view(r.state,caster.state)) for(const auto &t:r.triangles) {
+            const auto alpha=static_cast<std::uint32_t>(std::lround(opacity*255));
+            near_receivers(caster.state,x0,z0,x0+n*dx,z0+n*dz,[&](const Triangle &t) {
                 if(std::min({t[0][1],t[1][1],t[2][1]})>floor+height*.5f ||
                    std::max({t[0][1],t[1][1],t[2][1]})<floor-height*2 ||
                    std::max({t[0][0],t[1][0],t[2][0]})<x0 ||
                    std::min({t[0][0],t[1][0],t[2][0]})>x0+n*dx ||
                    std::max({t[0][2],t[1][2],t[2][2]})<z0 ||
-                   std::min({t[0][2],t[1][2],t[2][2]})>z0+n*dz) continue;
-                if(out.vertices.size()+3>120000) {++skipped_;break;}
+                   std::min({t[0][2],t[1][2],t[2][2]})>z0+n*dz) return true;
+                if(out.vertices.size()+3>120000) {++skipped_;return false;}
                 for(const auto &p:t) {
                     Vertex v;v.position={p[0],p[1]+bias+options.floor_offset,p[2],1};
                     v.texcoord={(p[0]-x0)/(n*dx),(p[2]-z0)/(n*dz)};
                     v.color=alpha<<24u;out.vertices.push_back(v);
                 }
                 ++conformed_;
-            }
+                return true;
+            });
             out.texture.enabled=true;out.texture.function=6;
             out.texture.address=0xF1000000u+static_cast<unsigned>(mask_jobs.size());
             out.texture.width=out.texture.height=static_cast<std::uint16_t>(n);
@@ -256,18 +401,19 @@ class PlanarShadows {
         }
         // Bin nearby receivers by mask row to bound clipping work.
         std::vector<std::vector<const Triangle *>> rows(n);
-        for(const Caster &r:receivers_) if(same_view(r.state,caster.state)) for(const auto &t:r.triangles) {
+        near_receivers(caster.state,x0,z0,x0+n*dx,z0+n*dz,[&](const Triangle &t) {
             const float low_y=std::min({t[0][1],t[1][1],t[2][1]});
             const float high_y=std::max({t[0][1],t[1][1],t[2][1]});
             const float left=std::min({t[0][0],t[1][0],t[2][0]});
             const float right=std::max({t[0][0],t[1][0],t[2][0]});
             const float low=std::min({t[0][2],t[1][2],t[2][2]});
             const float high=std::max({t[0][2],t[1][2],t[2][2]});
-            if(low_y>floor+height*0.5f || high_y<floor-height*2 || right<x0 || left>x0+n*dx || high<z0 || low>z0+n*dz) continue;
+            if(low_y>floor+height*0.5f || high_y<floor-height*2 || right<x0 || left>x0+n*dx || high<z0 || low>z0+n*dz) return true;
             const int first=int(std::clamp(std::floor((low-z0)/dz),0.0f,float(n-1)));
             const int last=int(std::clamp(std::floor((high-z0)/dz),0.0f,float(n-1)));
             for(int row=first;row<=last;++row) rows[row].push_back(&t);
-        }
+            return true;
+        });
         std::vector<unsigned char> mask(n * n, 0);
         for (auto &t : projected) {
             for (auto &p : t) { p[0] = (p[0] - x0) / dx; p[2] = (p[2] - z0) / dz; }
@@ -308,7 +454,7 @@ class PlanarShadows {
             if(!strength) {++x;continue;}
             const unsigned start=x++;
             while(x<n && coverage[z*n+x]==strength) ++x;
-            const auto alpha=static_cast<std::uint32_t>(std::lround(options.opacity*255.0f*strength/36.0f));
+            const auto alpha=static_cast<std::uint32_t>(std::lround(opacity*255.0f*strength/36.0f));
             if(!alpha) continue;
             const float left=x0+start*dx,right=x0+x*dx,low=z0+z*dz,high=low+dz;
             for(const Triangle *t:rows[z]) {
@@ -359,9 +505,9 @@ public:
         if (options.enabled && options.trace && frame % 120u == 0u)
             std::cout << "[shadows] previous frame: triangles=" << triangles_ << " silhouettes=" << emitted_
                       << " receiver triangles=" << receiver_triangles_ << " conformed=" << conformed_
-                      << " skipped=" << skipped_ << " raster samples=" << work_ << '\n';
+                      << " skipped=" << skipped_ << " lod culled=" << lod_culled_ << " raster samples=" << work_ << '\n';
         casters_.clear(); receivers_.clear(); finished_.clear();
-        receiver_triangles_=conformed_=0;triangles_ = work_ = emitted_ = skipped_ = 0; frame_ = frame;
+        receiver_triangles_=conformed_=0;triangles_ = work_ = emitted_ = skipped_ = lod_culled_ = 0; frame_ = frame;
     }
 
     void clear_target(std::uint32_t target) {
@@ -476,9 +622,19 @@ public:
         if(std::none_of(casters_.begin(),casters_.end(),[&](const Caster &c) {
             return c.state.target.color_address==target;
         })) return draws;
+        std::vector<Pick> picks;
         for (const Caster &caster : casters_) {
             if (caster.state.target.color_address != target || caster.triangles.empty()) continue;
-            auto draw = rasterize(caster);
+            Pick pick;
+            pick.caster = &caster;
+            if (!lod_select(caster, pick)) { ++lod_culled_; continue; }
+            picks.push_back(pick);
+        }
+        // With the limit on, the nearest casters get the shadow slots first.
+        if (options.lod != 0)
+            std::stable_sort(picks.begin(), picks.end(), [](const Pick &a, const Pick &b) { return a.distance < b.distance; });
+        for (const Pick &pick : picks) {
+            auto draw = rasterize(*pick.caster, pick.resolution, pick.fade);
             if (!draw.vertices.empty()) { ++emitted_; draws.push_back(std::move(draw)); }
         }
         if (!draws.empty() && options.trace && frame_ % 120u == 0u)

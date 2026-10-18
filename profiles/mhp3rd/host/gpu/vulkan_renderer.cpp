@@ -6562,6 +6562,7 @@ void VulkanRenderer::begin_frame() {
     shadow_options.gpu=shadow_settings.shadows_gpu;
     shadow_options.hide_original=shadow_settings.shadows_hide_original;
     shadow_options.resolution=shadow_settings.shadows_resolution;
+    shadow_options.lod=shadow_settings.shadows_distance;
     shadow_options.opacity=shadow_settings.shadows_opacity;
     shadow_options.direction_x=shadow_settings.shadows_x;
     shadow_options.direction_z=shadow_settings.shadows_z;

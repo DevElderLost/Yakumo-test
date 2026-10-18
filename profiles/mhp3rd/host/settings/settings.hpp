@@ -77,6 +77,7 @@ struct Settings {
     bool shadows_gpu{true};
     bool shadows_hide_original{true};
     std::uint32_t shadows_resolution{192u};
+    std::uint32_t shadows_distance{2u}; // 0 no limit; 1 short, 2 medium, 3 long
     float shadows_opacity{0.25f};
     float shadows_x{0.45f};
     float shadows_z{0.30f};

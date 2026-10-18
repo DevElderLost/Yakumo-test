@@ -451,6 +451,14 @@ void Menu::video() {
             s.shadows_resolution=values[cycle(index,delta,3)];settings::save();
         }
     }
+    {
+        static const std::array<const char *,4> labels{"Unlimited","Short","Medium","Long"};
+        const std::uint32_t value=std::min<std::uint32_t>(s.shadows_distance,3u);
+        if(int delta=choice_row("Shadow distance",std::string(labels[value]),
+            options_for("video.shadows_distance","Hides and simplifies silhouettes of hunters and monsters that are small on screen."))) {
+            s.shadows_distance=static_cast<std::uint32_t>(cycle(static_cast<int>(value),delta,4));settings::save();
+        }
+    }
     if(int delta=choice_row("Shadow opacity",std::to_string(int(std::lround(s.shadows_opacity*100)))+"%",
         options_for("video.shadows_opacity","Opacity from 0 to 60 percent."))) {
         s.shadows_opacity=std::clamp(s.shadows_opacity+delta*.05f,0.0f,.6f);settings::save();
@@ -653,6 +661,7 @@ void Menu::video() {
         restore("video.shadows_gpu", s.shadows_gpu, d.shadows_gpu);
         restore("video.shadows_hide_original", s.shadows_hide_original, d.shadows_hide_original);
         restore("video.shadows_resolution", s.shadows_resolution, d.shadows_resolution);
+        restore("video.shadows_distance", s.shadows_distance, d.shadows_distance);
         restore("video.shadows_opacity", s.shadows_opacity, d.shadows_opacity);
         restore("video.shadows_x", s.shadows_x, d.shadows_x);
         restore("video.shadows_z", s.shadows_z, d.shadows_z);
