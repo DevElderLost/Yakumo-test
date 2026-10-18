@@ -40,7 +40,20 @@ jobs:
       - name: Download ISO
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download game-data --repo "$GITHUB_REPOSITORY" --pattern MHP3RD.iso --dir "$RUNNER_TEMP"
+          # Release `game-data` ada di repo ini (peraltaklark/Yakumo), bukan
+          # di repo tempat workflow berjalan.
+          GAME_DATA_REPO: peraltaklark/Yakumo
+          GAME_DATA_TAG: game-data
+        run: |
+          set -e
+          for repo in "$GAME_DATA_REPO" "$GITHUB_REPOSITORY"; do
+            if gh release download "$GAME_DATA_TAG" --repo "$repo" --pattern MHP3RD.iso --dir "$RUNNER_TEMP" --clobber; then
+              echo "ISO diambil dari $repo (tag $GAME_DATA_TAG)"
+              break
+            fi
+            echo "tag $GAME_DATA_TAG tidak ada / gagal di $repo, coba berikutnya"
+          done
+          test -s "$RUNNER_TEMP/MHP3RD.iso" || { echo "::error::MHP3RD.iso tidak ditemukan di release $GAME_DATA_TAG"; exit 1; }
       - name: Host bootstrap, install, generate
         run: |
           cmake -S . -B out/mhp3rd -G Ninja -DCMAKE_BUILD_TYPE=Release \
